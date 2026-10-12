@@ -16,6 +16,7 @@ class OfficeHomeDataset(Dataset):
 
         self.classnames = self._load_classnames()
         self.data = self._create_data()
+        self.splits = self._create_splits()
 
     def _load_classnames(self) -> list:
         """it reads the class names from the folders of the first domain.
@@ -44,6 +45,26 @@ class OfficeHomeDataset(Dataset):
 
         return data
 
+    def _create_splits(self) -> dict:
+        """it splits each domain into visit1, visit2 and heldout images.
+        the split is done class by class so that every class appears in all three parts"""
+        rng = random.Random(self.seed)
+        groups = {}
+        for item in self.data:
+            groups.setdefault((item["domain"], item["label"]), []).append(item["id"])
+
+        splits = {domain: {"visit1": [], "visit2": [], "heldout": []} for domain in self.domains}
+        for (domain, _), ids in groups.items():
+            rng.shuffle(ids)
+            n1 = round(len(ids) * self.split_frac[0])
+            n2 = round(len(ids) * self.split_frac[1])
+            splits[domain]["visit1"] += ids[:n1]
+            splits[domain]["visit2"] += ids[n1:n1 + n2]
+            splits[domain]["heldout"] += ids[n1 + n2:]
+
+        return splits
+
+
     @staticmethod
     def _load_image(image_path: str) -> Image:
         image_path = Path(image_path)
@@ -55,7 +76,8 @@ class OfficeHomeDataset(Dataset):
 def main(seed: int) -> None:
     ds = OfficeHomeDataset(seed=seed)
     print(ds.classnames)
-    print(ds[0])
+    print(ds.data[0])
+    print(ds.splits.keys())
 
 if __name__ == "__main__":
     main(0)
