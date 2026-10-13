@@ -64,6 +64,36 @@ class OfficeHomeDataset(Dataset):
 
         return splits
 
+    def __len__(self) -> int:
+            return len(self.data)
+    
+    def __getitem__(self, idx: int) -> dict:
+        if idx >= len(self):
+            raise IndexError("Index is out of range!")
+
+        return self.data[idx]
+
+    def create_stream(self, order: list) -> tuple:
+        """it creates the test stream for a domain order. every domain is visited twice,
+        with different images each time. it returns the image ids in stream order and
+        the segments, where each segment is one visit of one domain"""
+        rng = random.Random(self.seed)
+        stream = []
+        segments = []
+        for visit in ["visit1", "visit2"]:
+            for domain in order:
+                ids = self.splits[domain][visit].copy()
+                # without the shuffle the images would come class by class
+                rng.shuffle(ids)
+                segments.append({"domain": domain, "visit": visit, "start": len(stream), "end": len(stream) + len(ids)})
+                stream += ids
+
+        return stream, segments
+    
+    def prompt_classnames(self) -> list:
+        """it returns the class names in a form usable in the text prompt, e.g. Alarm_Clock -> alarm clock"""
+        return [c.replace("_", " ").lower() for c in self.classnames]
+
 
     @staticmethod
     def _load_image(image_path: str) -> Image:
@@ -73,11 +103,27 @@ class OfficeHomeDataset(Dataset):
 
         return image
 
-def main(seed: int) -> None:
+def main(seed: int, order: list) -> None:
     ds = OfficeHomeDataset(seed=seed)
     print(ds.classnames)
     print(ds.data[0])
     print(ds.splits.keys())
 
+    print(len(ds))
+    print(ds[0])
+
+    for domain in ds.domains:
+        print(domain, {k: len(v) for k, v in ds.splits[domain].items()})
+
+    stream, segments = ds.create_stream(order)
+    print(len(stream))
+    for seg in segments:
+        print(seg)
+
+    print([ds[i]["label"] for i in stream[:20]])   # labels should look mixed, not 0,0,0,...
+    s = ds.splits["Art"]
+    print(len(set(s["visit1"]) & set(s["visit2"])), len(set(s["visit1"]) & set(s["heldout"])))   # both should be 0
+    
+
 if __name__ == "__main__":
-    main(0)
+   main(0, ["Art", "Clipart", "Product", "Real World"])
