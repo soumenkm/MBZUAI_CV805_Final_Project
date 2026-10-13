@@ -94,7 +94,6 @@ class OfficeHomeDataset(Dataset):
         """it returns the class names in a form usable in the text prompt, e.g. Alarm_Clock -> alarm clock"""
         return [c.replace("_", " ").lower() for c in self.classnames]
 
-
     @staticmethod
     def _load_image(image_path: str) -> Image:
         image_path = Path(image_path)
