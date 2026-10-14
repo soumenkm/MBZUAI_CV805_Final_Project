@@ -6,9 +6,10 @@ from tqdm import tqdm
 from data import OfficeHomeDataset
 from config import clip_name, template
 import math
+import random
 
 class CacheModel:
-    def __init__(self) -> None:
+    def __init__(self, alpha: float = 2.0, beta: float = 5.0) -> None:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.cwd = Path.cwd()
         self.weights_path = Path(self.cwd, "models/vit_base_patch16_clip_224.openai/open_clip_pytorch_model.bin")
@@ -22,6 +23,10 @@ class CacheModel:
             self.labels = feats["labels"].to(self.device)
             self.domains = feats["domains"]
             self.num_classes = len(self.text_feats)
+
+        self.alpha = alpha
+        self.beta = beta
+        self.reset()
 
     def extract_features(self, dataset: OfficeHomeDataset, batch_size: int = 256) -> None:
         """it runs frozen clip once over all images and class prompts and saves the normalized features.
@@ -63,22 +68,58 @@ class CacheModel:
         entropy = -(probs * probs.clamp_min(1e-12).log()).sum(-1) / math.log(self.num_classes)
         return logits, probs.argmax(-1), entropy, probs.max(-1).values
 
-def main(taus: list) -> None:
+    def reset(self) -> None:
+        """it empties the cache before a new run. the cache stores image ids,
+        and their features are looked up from the saved features when needed"""
+        self.cache = {"ids": [], "labels": [], "entropy": [], "time": []}
+
+    def cache_logits(self, feats: torch.Tensor, ids: list = None, labels: list = None) -> torch.Tensor:
+        """it adds up the votes of the cached images for every class.
+        by default it uses the current cache, but other images can be passed to try a cache that doesn't exist"""
+        ids = self.cache["ids"] if ids is None else ids
+        labels = self.cache["labels"] if labels is None else labels
+        if len(ids) == 0:
+            return torch.zeros(len(feats), self.num_classes, device=self.device)
+
+        votes = torch.exp(-self.beta * (1 - feats @ self.image_feats[ids].T))
+        onehot = F.one_hot(torch.tensor(labels, device=self.device), self.num_classes).float()
+        # each vote is added to the class of its cached image
+        return self.alpha * votes @ onehot
+
+    def predict(self, ids: list) -> torch.Tensor:
+        """it predicts the class of the given images using zero-shot logits plus the cache votes"""
+        feats = self.image_feats[ids]
+        logits = self.zero_shot(feats)[0] + self.cache_logits(feats)
+        return logits.argmax(-1)
+
+def main(alpha: float, beta: float, shots: int) -> None:
     ds = OfficeHomeDataset(seed=0)
-    model = CacheModel()
-    model.extract_features(ds)
+    model = CacheModel(alpha=alpha, beta=beta)
+    heldout = [i for d in ds.domains for i in ds.splits[d]["heldout"]]
+    visit1 = [i for d in ds.domains for i in ds.splits[d]["visit1"]]
 
-    _, preds, entropy, _ = model.zero_shot(model.image_feats)
-    correct = (preds == model.labels).float()
-    print(f"zero-shot accuracy, all images: {correct.mean().item() * 100:.2f}%")
+    zs_preds = model.zero_shot(model.image_feats[heldout])[1]
+    print(f"\nalpha {alpha}, beta {beta}, {shots} shots per class")
+    print(f"zero-shot heldout accuracy: {(zs_preds == model.labels[heldout]).float().mean().item() * 100:.2f}%")
+    print(f"empty cache heldout accuracy: {(model.predict(heldout) == model.labels[heldout]).float().mean().item() * 100:.2f}%")
 
-    for domain in ds.domains:
-        mask = torch.tensor([d == domain for d in model.domains], device=model.device)
-        print(f"\n{domain}: zero-shot accuracy {correct[mask].mean().item() * 100:.2f}%, mean entropy {entropy[mask].mean().item():.3f}")
-        for tau in taus:
-            admitted = mask & (entropy < tau)
-            # how many images of this domain would enter the cache, and how many of them have a correct label
-            print(f"  tau {tau}: admitted {admitted.sum().item() / mask.sum().item() * 100:.1f}%, label accuracy of admitted {correct[admitted].mean().item() * 100:.1f}%")
+    # fill the cache by hand with a few visit1 images per class, once with true labels and once with zero-shot labels
+    rng = random.Random(0)
+    picked = []
+    for c in range(model.num_classes):
+        pool = [i for i in visit1 if model.labels[i].item() == c and model.zero_shot(model.image_feats[[i]])[2].item() < 0.3]
+        picked += rng.sample(pool, shots)
+
+    for label_type in ["true", "zero-shot"]:
+        model.reset()
+        model.cache["ids"] = picked
+        if label_type == "true":
+            model.cache["labels"] = model.labels[picked].tolist()
+        else:
+            model.cache["labels"] = model.zero_shot(model.image_feats[picked])[1].tolist()
+        acc = (model.predict(heldout) == model.labels[heldout]).float().mean().item()
+        print(f"cache with {label_type} labels, heldout accuracy: {acc * 100:.2f}%")
 
 if __name__ == "__main__":
-    main([0.1, 0.2, 0.3, 0.4, 0.5])
+    for alpha in [0.25, 0.5, 1.0, 2.0]:
+        main(alpha=alpha, beta=5.0, shots=3)
