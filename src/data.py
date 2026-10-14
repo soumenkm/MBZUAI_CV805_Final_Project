@@ -3,6 +3,7 @@ from pathlib import Path
 from PIL import Image
 from torch.utils.data import Dataset
 from config import domains, split_frac
+import math
 
 class OfficeHomeDataset(Dataset):
     def __init__(self, seed: int = 0) -> None:
@@ -73,7 +74,7 @@ class OfficeHomeDataset(Dataset):
 
         return self.data[idx]
 
-    def create_stream(self, order: list) -> tuple:
+    def create_stream(self, order: list, frac: float = 1.0) -> tuple:
         """it creates the test stream for a domain order. every domain is visited twice,
         with different images each time. it returns the image ids in stream order and
         the segments, where each segment is one visit of one domain"""
@@ -85,6 +86,7 @@ class OfficeHomeDataset(Dataset):
                 ids = self.splits[domain][visit].copy()
                 # without the shuffle the images would come class by class
                 rng.shuffle(ids)
+                ids = ids[:math.floor(len(ids) * frac)]
                 segments.append({"domain": domain, "visit": visit, "start": len(stream), "end": len(stream) + len(ids)})
                 stream += ids
 

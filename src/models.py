@@ -9,7 +9,9 @@ import math
 import random
 
 class CacheModel:
-    def __init__(self, alpha: float = 2.0, beta: float = 5.0) -> None:
+    def __init__(self, eviction: str = "entropy", slots: int | None = 3, alpha: float = 2.0, beta: float = 5.0, tau: float = 0.3, seed: int = 0, true_labels: bool = False) -> None:
+        if eviction not in ["fifo", "random", "entropy", "oracle"]:
+            raise ValueError(f"Unknown eviction rule: {eviction}")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.cwd = Path.cwd()
         self.weights_path = Path(self.cwd, "models/vit_base_patch16_clip_224.openai/open_clip_pytorch_model.bin")
@@ -27,6 +29,12 @@ class CacheModel:
         self.alpha = alpha
         self.beta = beta
         self.reset()
+
+        self.eviction = eviction
+        self.slots = slots
+        self.tau = tau
+        self.true_labels = true_labels
+        self.rng = random.Random(seed)
 
     def extract_features(self, dataset: OfficeHomeDataset, batch_size: int = 256) -> None:
         """it runs frozen clip once over all images and class prompts and saves the normalized features.
@@ -92,34 +100,70 @@ class CacheModel:
         logits = self.zero_shot(feats)[0] + self.cache_logits(feats)
         return logits.argmax(-1)
 
-def main(alpha: float, beta: float, shots: int) -> None:
+    def update(self, idx: int, step: int) -> dict:
+        """it decides if the image enters the cache and, if its class is full, which entry leaves.
+        it is called after the image is predicted. it returns the image ids added and removed (None if nothing changed)"""
+        _, pred, entropy, _ = self.zero_shot(self.image_feats[[idx]])
+        c, entropy = pred.item(), entropy.item()
+        if self.true_labels:
+            c = self.labels[idx].item()
+        event = {"step": step, "added": None, "removed": None}
+        if entropy >= self.tau:
+            return event
+
+        in_class = [i for i, label in enumerate(self.cache["labels"]) if label == c]
+        if self.slots is not None and len(in_class) >= self.slots:
+            pos = self.evict(c, idx, in_class)
+            event["removed"] = self.cache["ids"][pos]
+            for key in self.cache:
+                self.cache[key].pop(pos)
+
+        for key, val in zip(self.cache, [idx, c, entropy, step]):
+            self.cache[key].append(val)
+        event["added"] = idx
+
+        return event
+
+    def evict(self, c: int, idx: int, in_class: list) -> int:
+        """it returns the cache position of the class c entry to remove, using the eviction rule of this run.
+        in_class has the cache positions of all class c entries"""
+        if self.eviction == "fifo":
+            return min(in_class, key=lambda i: self.cache["time"][i])
+        if self.eviction == "random":
+            return self.rng.choice(in_class)
+        if self.eviction == "oracle":
+            # the oracle can see true labels, so wrongly labelled entries go first
+            wrong = [i for i in in_class if self.labels[self.cache["ids"][i]].item() != c]
+            in_class = wrong if wrong else in_class
+
+        # remove the least confident entry. this is the entropy rule, and also the fallback for oracle
+        return max(in_class, key=lambda i: self.cache["entropy"][i])
+
+def main(runs: list, tau: float) -> None:
     ds = OfficeHomeDataset(seed=0)
-    model = CacheModel(alpha=alpha, beta=beta)
-    heldout = [i for d in ds.domains for i in ds.splits[d]["heldout"]]
-    visit1 = [i for d in ds.domains for i in ds.splits[d]["visit1"]]
+    stream, segments = ds.create_stream(ds.domains, frac=0.1)
 
-    zs_preds = model.zero_shot(model.image_feats[heldout])[1]
-    print(f"\nalpha {alpha}, beta {beta}, {shots} shots per class")
-    print(f"zero-shot heldout accuracy: {(zs_preds == model.labels[heldout]).float().mean().item() * 100:.2f}%")
-    print(f"empty cache heldout accuracy: {(model.predict(heldout) == model.labels[heldout]).float().mean().item() * 100:.2f}%")
+    model = CacheModel(tau=tau)
+    zs_correct = (model.zero_shot(model.image_feats[stream])[1] == model.labels[stream]).float()
+    results = {"zero-shot": zs_correct}
 
-    # fill the cache by hand with a few visit1 images per class, once with true labels and once with zero-shot labels
-    rng = random.Random(0)
-    picked = []
-    for c in range(model.num_classes):
-        pool = [i for i in visit1 if model.labels[i].item() == c and model.zero_shot(model.image_feats[[i]])[2].item() < 0.3]
-        picked += rng.sample(pool, shots)
+    for name, eviction, slots, beta, true_labels, run_tau in runs:
+        model = CacheModel(eviction=eviction, slots=slots, beta=beta, tau=run_tau, true_labels=true_labels)
+        correct = []
+        for step, idx in enumerate(tqdm(stream, f"Running {name}", unit="images")):
+            # predict first, then update, so an image never helps its own prediction
+            correct.append(int(model.predict([idx]).item() == model.labels[idx].item()))
+            model.update(idx, step)
+        results[name] = torch.tensor(correct, dtype=torch.float)
+        print(f"{name}: final cache size {len(model.cache['ids'])}")
 
-    for label_type in ["true", "zero-shot"]:
-        model.reset()
-        model.cache["ids"] = picked
-        if label_type == "true":
-            model.cache["labels"] = model.labels[picked].tolist()
-        else:
-            model.cache["labels"] = model.zero_shot(model.image_feats[picked])[1].tolist()
-        acc = (model.predict(heldout) == model.labels[heldout]).float().mean().item()
-        print(f"cache with {label_type} labels, heldout accuracy: {acc * 100:.2f}%")
+    print("\nonline accuracy (%) per segment")
+    print(f"{'method':<12}{'all':>7}" + "".join(f"{s['domain'][:4] + s['visit'][-1]:>8}" for s in segments))
+    for name, correct in results.items():
+        correct = correct.cpu()
+        row = "".join(f"{correct[s['start']:s['end']].mean().item() * 100:>8.2f}" for s in segments)
+        print(f"{name:<12}{correct.mean().item() * 100:>7.2f}{row}")
 
 if __name__ == "__main__":
-    for alpha in [0.25, 0.5, 1.0, 2.0]:
-        main(alpha=alpha, beta=5.0, shots=3)
+    main(runs=[("beta5", "entropy", 3, 5.0, False, 0.3), ("beta10", "entropy", 3, 10.0, False, 0.3),
+               ("true5_all", "fifo", 3, 5.0, True, 1.01), ("true10_all", "fifo", 3, 10.0, True, 1.01)], tau=0.3)
