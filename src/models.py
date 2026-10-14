@@ -9,15 +9,16 @@ import math
 import random
 
 class CacheModel:
-    def __init__(self, eviction: str = "entropy", slots: int | None = 3, alpha: float = 2.0, beta: float = 5.0, tau: float = 0.3, seed: int = 0, true_labels: bool = False) -> None:
-        if eviction not in ["fifo", "random", "entropy", "oracle"]:
+    def __init__(self, eviction: str = "entropy", slots: int | None = 3, alpha: float = 2.0, beta: float = 5.0, tau: float = 0.3, seed: int = 0, true_labels: bool = False, anchor_frac: float = 0.25,) -> None:
+        if eviction not in ["fifo", "random", "entropy", "oracle", "cmr"]:
             raise ValueError(f"Unknown eviction rule: {eviction}")
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.cwd = Path.cwd()
         self.weights_path = Path(self.cwd, "models/vit_base_patch16_clip_224.openai/open_clip_pytorch_model.bin")
         self.feature_path = Path(self.cwd, "data/features_vitb16.pt")
 
-        # the saved features are loaded. on the very first run they don't, so extract_features must run first
+        # the saved features are loaded if they exist. on the very first run they don't, so extract_features must run first
         if self.feature_path.exists():
             feats = torch.load(self.feature_path)
             self.image_feats = feats["image_feats"].to(self.device)
@@ -26,15 +27,21 @@ class CacheModel:
             self.domains = feats["domains"]
             self.num_classes = len(self.text_feats)
 
+        self.eviction = eviction
         self.alpha = alpha
         self.beta = beta
-        self.reset()
-
-        self.eviction = eviction
-        self.slots = slots
         self.tau = tau
         self.true_labels = true_labels
         self.rng = random.Random(seed)
+
+        # anchors use part of the memory, so cmr gets fewer cache slots than the other methods.
+        self.slots = slots
+        self.num_anchors = 0
+        if eviction == "cmr":
+            self.num_anchors = round(anchor_frac * slots * self.num_classes)
+            self.slots = (slots * self.num_classes - self.num_anchors) // self.num_classes
+
+        self.reset()
 
     def extract_features(self, dataset: OfficeHomeDataset, batch_size: int = 256) -> None:
         """it runs frozen clip once over all images and class prompts and saves the normalized features.
@@ -80,6 +87,8 @@ class CacheModel:
         """it empties the cache before a new run. the cache stores image ids,
         and their features are looked up from the saved features when needed"""
         self.cache = {"ids": [], "labels": [], "entropy": [], "time": []}
+        self.anchors = {"ids": [], "labels": [], "weights": []}
+        self.num_seen = 0
 
     def cache_logits(self, feats: torch.Tensor, ids: list = None, labels: list = None) -> torch.Tensor:
         """it adds up the votes of the cached images for every class.
@@ -103,8 +112,8 @@ class CacheModel:
     def update(self, idx: int, step: int) -> dict:
         """it decides if the image enters the cache and, if its class is full, which entry leaves.
         it is called after the image is predicted. it returns the image ids added and removed (None if nothing changed)"""
-        _, pred, entropy, _ = self.zero_shot(self.image_feats[[idx]])
-        c, entropy = pred.item(), entropy.item()
+        _, pred, entropy, top_prob = self.zero_shot(self.image_feats[[idx]])
+        c, entropy, top_prob = pred.item(), entropy.item(), top_prob.item()
         if self.true_labels:
             c = self.labels[idx].item()
         event = {"step": step, "added": None, "removed": None}
@@ -122,6 +131,10 @@ class CacheModel:
             self.cache[key].append(val)
         event["added"] = idx
 
+        # the image becomes an anchor only after the eviction, so it never protects itself
+        if self.num_anchors > 0:
+            self.add_anchor(idx, c, top_prob)
+
         return event
 
     def evict(self, c: int, idx: int, in_class: list) -> int:
@@ -136,34 +149,127 @@ class CacheModel:
             wrong = [i for i in in_class if self.labels[self.cache["ids"][i]].item() != c]
             in_class = wrong if wrong else in_class
 
-        # remove the least confident entry. this is the entropy rule, and also the fallback for oracle
+        if self.eviction == "cmr" and len(self.anchors["ids"]) > 0:
+            harm = self.cmr_harm(c, idx, in_class)
+            return in_class[harm.argmin().item()]
+
+        # remove the least confident entry.
         return max(in_class, key=lambda i: self.cache["entropy"][i])
 
-def main(runs: list, tau: float) -> None:
+    def add_anchor(self, idx: int, label: int, weight: float) -> None:
+        """it keeps a fixed size random sample of past admitted images as anchors (reservoir sampling).
+        label is the zero-shot label and weight is the zero-shot top probability"""
+        self.num_seen += 1
+        item = [idx, label, weight]
+        if len(self.anchors["ids"]) < self.num_anchors:
+            for key, val in zip(self.anchors, item):
+                self.anchors[key].append(val)
+            return
+
+        # every past image keeps the same chance num_anchors / num_seen of being an anchor
+        pos = self.rng.randrange(self.num_seen)
+        if pos < self.num_anchors:
+            for key, val in zip(self.anchors, item):
+                self.anchors[key][pos] = val
+
+    def _anchor_tensors(self) -> tuple:
+        """it returns the features, labels and weights of the anchors as tensors"""
+        feats = self.image_feats[self.anchors["ids"]]
+        labels = torch.tensor(self.anchors["labels"], device=self.device)
+        weights = torch.tensor(self.anchors["weights"], device=self.device)
+        return feats, labels, weights
+
+    @staticmethod
+    def _margin(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """score of the label minus the best other score, for every row"""
+        rows = torch.arange(len(labels), device=logits.device)
+        others = logits.clone()
+        others[rows, labels] = -float("inf")
+        return logits[rows, labels] - others.max(-1).values
+
+    def cmr_harm_slow(self, c: int, idx: int, in_class: list) -> torch.Tensor:
+        """for every candidate it rebuilds the cache with the candidate swapped for the new image
+        and adds up how much worse the anchors get. simple but slow, used to check cmr_harm"""
+        feats, labels, weights = self._anchor_tensors()
+        zs_logits = self.zero_shot(feats)[0]
+        margin_old = self._margin(zs_logits + self.cache_logits(feats), labels)
+
+        harm = []
+        for pos in in_class:
+            ids = [i for k, i in enumerate(self.cache["ids"]) if k != pos] + [idx]
+            labs = [l for k, l in enumerate(self.cache["labels"]) if k != pos] + [c]
+            margin_new = self._margin(zs_logits + self.cache_logits(feats, ids, labs), labels)
+            loss_change = F.softplus(-margin_new) - F.softplus(-margin_old)
+            harm.append((weights * loss_change.clamp(min=0)).sum())
+
+        return torch.stack(harm)
+
+    def cmr_harm(self, c: int, idx: int, in_class: list) -> torch.Tensor:
+        """same result as cmr_harm_slow, but faster. a swap only changes the class c score,
+        so the new margins are computed directly without rebuilding the cache"""
+        feats, labels, weights = self._anchor_tensors()
+        logits = self.zero_shot(feats)[0] + self.cache_logits(feats)
+        rows = torch.arange(len(labels), device=self.device)
+
+        cand_ids = [self.cache["ids"][i] for i in in_class]
+        vote_new = torch.exp(-self.beta * (1 - feats @ self.image_feats[idx]))           # (anchors,)
+        vote_old = torch.exp(-self.beta * (1 - feats @ self.image_feats[cand_ids].T))    # (anchors, candidates)
+        new_c = logits[:, c:c + 1] + self.alpha * (vote_new[:, None] - vote_old)         # class c score after each swap
+
+        # best score among classes that are neither the anchor's label nor c, a swap never changes it
+        others = logits.clone()
+        others[rows, labels] = -float("inf")
+        others[:, c] = -float("inf")
+        best_other = others.max(-1).values[:, None]
+        own = logits[rows, labels][:, None]
+
+        # if the anchor's label is c the swap moves its own score, otherwise it can only move a rival
+        margin_new = torch.where((labels == c)[:, None], new_c - best_other, own - torch.maximum(best_other, new_c))
+        margin_old = self._margin(logits, labels)[:, None]
+
+        loss_change = F.softplus(-margin_new) - F.softplus(-margin_old)
+        return (weights[:, None] * loss_change.clamp(min=0)).sum(0)
+
+    def memory_used(self) -> int:
+        """number of stored images, cache plus anchors"""
+        return len(self.cache["ids"]) + len(self.anchors["ids"])
+
+def main(runs: list, tau: float, check_steps: int) -> None:
     ds = OfficeHomeDataset(seed=0)
     stream, segments = ds.create_stream(ds.domains, frac=0.1)
 
-    model = CacheModel(tau=tau)
-    zs_correct = (model.zero_shot(model.image_feats[stream])[1] == model.labels[stream]).float()
-    results = {"zero-shot": zs_correct}
+    # check 1: fast and slow cmr harm should give the same numbers
+    model = CacheModel(eviction="cmr", slots=3, tau=tau)
+    for step, idx in enumerate(stream[:check_steps]):
+        model.update(idx, step)
+    diffs, same_choice = [], 0
+    classes = sorted(set(model.cache["labels"]))
+    for c in classes:
+        in_class = [i for i, label in enumerate(model.cache["labels"]) if label == c]
+        fast = model.cmr_harm(c, stream[check_steps], in_class)
+        slow = model.cmr_harm_slow(c, stream[check_steps], in_class)
+        diffs.append((fast - slow).abs().max().item())
+        same_choice += int(fast.argmin() == slow.argmin())
+    print(f"cmr check: max difference {max(diffs):.2e}, same choice in {same_choice} of {len(classes)} classes")
+    print(f"cmr memory: {model.slots} cache slots per class + {model.num_anchors} anchors, memory used {model.memory_used()}")
 
-    for name, eviction, slots, beta, true_labels, run_tau in runs:
-        model = CacheModel(eviction=eviction, slots=slots, beta=beta, tau=run_tau, true_labels=true_labels)
+    # check 2: cmr against entropy on the full stream
+    model = CacheModel(tau=tau)
+    results = {"zero-shot": (model.zero_shot(model.image_feats[stream])[1] == model.labels[stream]).float().cpu()}
+    for name, eviction, slots in runs:
+        model = CacheModel(eviction=eviction, slots=slots, tau=tau)
         correct = []
         for step, idx in enumerate(tqdm(stream, f"Running {name}", unit="images")):
-            # predict first, then update, so an image never helps its own prediction
             correct.append(int(model.predict([idx]).item() == model.labels[idx].item()))
             model.update(idx, step)
         results[name] = torch.tensor(correct, dtype=torch.float)
-        print(f"{name}: final cache size {len(model.cache['ids'])}")
 
     print("\nonline accuracy (%) per segment")
     print(f"{'method':<12}{'all':>7}" + "".join(f"{s['domain'][:4] + s['visit'][-1]:>8}" for s in segments))
     for name, correct in results.items():
-        correct = correct.cpu()
         row = "".join(f"{correct[s['start']:s['end']].mean().item() * 100:>8.2f}" for s in segments)
         print(f"{name:<12}{correct.mean().item() * 100:>7.2f}{row}")
 
 if __name__ == "__main__":
-    main(runs=[("beta5", "entropy", 3, 5.0, False, 0.3), ("beta10", "entropy", 3, 10.0, False, 0.3),
-               ("true5_all", "fifo", 3, 5.0, True, 1.01), ("true10_all", "fifo", 3, 10.0, True, 1.01)], tau=0.3)
+    main(runs=[("entropy", "entropy", 3), ("cmr", "cmr", 3), ("entropy6", "entropy", 6), ("cmr6", "cmr", 6)],
+         tau=0.3, check_steps=600)
