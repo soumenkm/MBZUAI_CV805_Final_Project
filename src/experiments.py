@@ -42,13 +42,29 @@ class Experiments:
         temp_path.replace(json_path)
         print(f"JSON file saved at {json_path}")
 
+    def zero_shot_stats(self, taus: list) -> None:
+        """it saves the zero-shot accuracy of every domain and, for every tau, how many images
+        would enter the cache and how many of them have a correct label"""
+        model = CacheModel()
+        _, preds, entropy, _ = model.zero_shot(model.image_feats)
+        correct = (preds == model.labels).float()
+
+        stats = {}
+        for domain in self.dataset.domains:
+            mask = torch.tensor([d == domain for d in model.domains], device=model.device)
+            stats[domain] = {"zero_shot_acc": correct[mask].mean().item()}
+            for tau in taus:
+                admitted = mask & (entropy < tau)
+                stats[domain][f"tau{tau}"] = {
+                    "admitted": (admitted.sum() / mask.sum()).item(),
+                    "label_acc": correct[admitted].mean().item()
+                }
+
+        self._save_json(Path(self.cwd, "outputs/zero_shot_stats.json"), stats)
+
 def main(order: list, seed: int, frac: float) -> None:
     exp = Experiments(order=order, seed=seed, frac=frac)
-    print(exp.order_tag, len(exp.stream))
-    print({domain: len(ids) for domain, ids in exp.heldout.items()})
-
-    exp._save_json(Path(exp.output_dir, "test.json"), {"segments": exp.segments})
-    print(exp._load_json(Path(exp.output_dir, "test.json"))["segments"][0])
+    exp.zero_shot_stats(taus=[0.1, 0.2, 0.3, 0.4, 0.5])
 
 if __name__ == "__main__":
     main(["Art", "Clipart", "Product", "Real World"], 0, 0.1)
