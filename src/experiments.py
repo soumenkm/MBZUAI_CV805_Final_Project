@@ -62,9 +62,64 @@ class Experiments:
 
         self._save_json(Path(self.cwd, "outputs/zero_shot_stats.json"), stats)
 
-def main(order: list, seed: int, frac: float) -> None:
-    exp = Experiments(order=order, seed=seed, frac=frac)
-    exp.zero_shot_stats(taus=[0.1, 0.2, 0.3, 0.4, 0.5])
+    def run(self, name: str, eviction: str | None, slots: int | None, true_labels: bool = False, tau: float | None = None) -> None:
+        """it runs one method over the stream: it predicts each image first, then updates the cache.
+        eviction None means zero-shot, the cache is never updated. the result is saved as a json file
+        and the run is skipped if that file already exists"""
+        tau = self.tau if tau is None else tau
+        run_path = Path(self.output_dir, f"{name}_{self.order_tag}_seed{self.seed}_frac{self.frac}.json")
+        if run_path.exists():
+            print(f"Run already exists at {run_path}")
+            return
+
+        model = CacheModel(eviction=eviction or "entropy", slots=slots, alpha=self.alpha, beta=self.beta,
+                           tau=tau, true_labels=true_labels, seed=self.seed)
+        correct, events = [], []
+
+        start_time = time.time()
+        for step, idx in enumerate(tqdm(self.stream, f"Running {name} ({self.order_tag}, seed {self.seed})", unit="images")):
+            correct.append(int(model.predict([idx]).item() == model.labels[idx].item()))
+            if eviction is not None:
+                event = model.update(idx, step)
+                # only the steps where the cache changed are kept, they are enough to rebuild the cache later
+                if event["added"] is not None:
+                    events.append([step, event["added"], event["removed"]])
+        seconds_per_image = (time.time() - start_time) / len(self.stream)
+
+        result = {
+            "name": name,
+            "eviction": eviction,
+            "slots": slots,
+            "cache_slots": model.slots,
+            "num_anchors": model.num_anchors,
+            "memory_used": model.memory_used(),
+            "true_labels": true_labels,
+            "alpha": self.alpha,
+            "beta": self.beta,
+            "tau": tau,
+            "order": self.order,
+            "seed": self.seed,
+            "frac": self.frac,
+            "segments": self.segments,
+            "correct": correct,
+            "events": events,
+            "seconds_per_image": seconds_per_image
+        }
+        self._save_json(run_path, result)
+        print(f"{name}: online accuracy {sum(correct) / len(correct) * 100:.2f}%")
+
+def main(order: list, seeds: list, frac: float, runs: list) -> None:
+    for seed in seeds:
+        exp = Experiments(order=order, seed=seed, frac=frac)
+        if seed == seeds[0]:
+            exp.zero_shot_stats(taus=[0.1, 0.2, 0.3, 0.4, 0.5])
+        for run in runs:
+            exp.run(**run)
 
 if __name__ == "__main__":
-    main(["Art", "Clipart", "Product", "Real World"], 0, 0.1)
+    runs = [
+        {"name": "zero_shot", "eviction": None, "slots": None},
+        {"name": "entropy", "eviction": "entropy", "slots": 3},
+        {"name": "cmr", "eviction": "cmr", "slots": 3},
+    ]
+    main(["Art", "Clipart", "Product", "Real World"], [0], 0.1, runs)
