@@ -87,10 +87,11 @@ class Experiments:
                 # only the steps where the cache changed are kept, they are enough to rebuild the cache later
                 if event["added"] is not None:
                     events.append([step, event["added"], event["removed"]])
-                if (step + 1) % log_every == 0:
-                    composition.append({"step": step + 1, "counts": self._cache_composition(model)})
-                if step + 1 in seg_ends:
-                    heldout.append({"segment": seg_ends[step + 1], "acc": self._heldout_acc(model)})
+
+            if (step + 1) % log_every == 0:
+                composition.append({"step": step + 1, "counts": self._cache_composition(model)})
+            if step + 1 in seg_ends:
+                heldout.append({"segment": seg_ends[step + 1], "acc": self._heldout_acc(model)})
         seconds_per_image = (time.time() - start_time) / len(self.stream)
 
         result = {

@@ -35,6 +35,71 @@ class Analysis:
 
         return runs
 
+    @staticmethod
+    def online_accuracy(run: dict) -> dict:
+        """accuracy of the predictions made while the stream arrived, for the whole stream and for every segment"""
+        correct = np.array(run["correct"])
+        acc = {"all": correct.mean()}
+        for seg in run["segments"]:
+            acc[f"{seg['domain']}_{seg['visit']}"] = correct[seg["start"]:seg["end"]].mean()
+
+        return acc
+
+    @staticmethod
+    def earlier_domain_accuracy(run: dict) -> float:
+        """average heldout accuracy on the domains seen before the current segment, measured at the end of every segment.
+        the current domain is left out because it shows adaptation, not memory"""
+        accs = []
+        for h in run.get("heldout", []):
+            current = run["segments"][h["segment"]]["domain"]
+            earlier = {seg["domain"] for seg in run["segments"][:h["segment"]]} - {current}
+            accs += [h["acc"][d] for d in earlier]
+
+        return np.mean(accs) if accs else np.nan
+
+    @staticmethod
+    def forgetting(run: dict) -> float:
+        """for every domain: best heldout accuracy after the domain was first seen minus the final heldout accuracy.
+        it returns the average over domains, a larger value means more forgetting"""
+        heldout = run.get("heldout", [])
+        if not heldout:
+            return np.nan
+
+        values = []
+        for domain in heldout[-1]["acc"]:
+            first = min(i for i, seg in enumerate(run["segments"]) if seg["domain"] == domain)
+            best = max(h["acc"][domain] for h in heldout if h["segment"] >= first)
+            values.append(best - heldout[-1]["acc"][domain])
+
+        return np.mean(values)
+
+    @staticmethod
+    def return_accuracy(run: dict, k: int) -> float:
+        """accuracy on the first k images of every domain's second visit, averaged over domains.
+        compare it with the zero-shot row: a higher value means the method remembers the domain when it comes back"""
+        correct = np.array(run["correct"])
+        accs = [correct[seg["start"]:seg["start"] + k].mean() for seg in run["segments"] if seg["visit"] == "visit2"]
+
+        return np.mean(accs)
+
+    def summary(self, k: int = 100) -> pd.DataFrame:
+        """one row per method with the mean and std over seeds of every metric"""
+        rows = []
+        for name, runs in self.runs.items():
+            for seed, run in runs.items():
+                online = self.online_accuracy(run)
+                rows.append({
+                    "method": name,
+                    "online": online["all"],
+                    "clipart": np.mean([v for key, v in online.items() if key.startswith("Clipart")]),
+                    "earlier": self.earlier_domain_accuracy(run),
+                    "forgetting": self.forgetting(run),
+                    "return": self.return_accuracy(run, k),
+                    "memory": run["memory_used"]
+                })
+
+        return pd.DataFrame(rows).groupby("method").agg(["mean", "std"])
+
     def zero_shot_table(self, tau: float = 0.3) -> None:
         """it saves table 1: zero-shot accuracy, admission rate and label accuracy of admitted images for every domain"""
         with open(Path(self.output_dir, "zero_shot_stats.json"), mode="r", encoding="utf-8") as f:
@@ -55,9 +120,27 @@ class Analysis:
         print(df.to_string(index=False))
         print(f"Table saved at {csv_path}")
 
+    def main_table(self, methods: list) -> None:
+        """it saves the main results as a csv file: one row per method, values in percent as mean and std over seeds"""
+        summary = self.summary()
+        summary = summary.loc[[m for m in methods if m in summary.index]]
+        # flatten the two level column names, e.g. (online, mean) -> online_mean
+        summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+        summary = summary.drop(columns="memory_std")
+        for col in summary.columns:
+            if col != "memory_mean":
+                summary[col] = summary[col] * 100
+        summary = summary.round(2)
+
+        csv_path = Path(self.table_dir, f"main_{self.order_tag}_frac{self.frac}.csv")
+        summary.to_csv(csv_path)
+        print(summary.to_string())
+        print(f"Table saved at {csv_path}")
+
 def main(order_tag: str, seeds: list, frac: float) -> None:
     ana = Analysis(order_tag=order_tag, seeds=seeds, frac=frac)
     ana.zero_shot_table(tau=0.3)
+    ana.main_table(["zero_shot", "unbounded", "fifo", "entropy", "oracle", "cmr", "true_labels"])
 
 if __name__ == "__main__":
     main("ACPR", [0], 0.1)
