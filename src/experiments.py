@@ -62,10 +62,12 @@ class Experiments:
 
         self._save_json(Path(self.cwd, "outputs/zero_shot_stats.json"), stats)
 
-    def run(self, name: str, eviction: str | None, slots: int | None, true_labels: bool = False, tau: float | None = None) -> None:
+    def run(self, name: str, eviction: str | None, slots: int | None, true_labels: bool = False,
+               tau: float | None = None, log_every: int = 100) -> None:
         """it runs one method over the stream: it predicts each image first, then updates the cache.
         eviction None means zero-shot, the cache is never updated. the result is saved as a json file
-        and the run is skipped if that file already exists"""
+        and the run is skipped if that file already exists. at the end of every segment it measures 
+        the heldout accuracy of every domain."""
         tau = self.tau if tau is None else tau
         run_path = Path(self.output_dir, f"{name}_{self.order_tag}_seed{self.seed}_frac{self.frac}.json")
         if run_path.exists():
@@ -74,7 +76,8 @@ class Experiments:
 
         model = CacheModel(eviction=eviction or "entropy", slots=slots, alpha=self.alpha, beta=self.beta,
                            tau=tau, true_labels=true_labels, seed=self.seed)
-        correct, events = [], []
+        seg_ends = {seg["end"]: i for i, seg in enumerate(self.segments)}
+        correct, events, heldout, composition = [], [], [], []
 
         start_time = time.time()
         for step, idx in enumerate(tqdm(self.stream, f"Running {name} ({self.order_tag}, seed {self.seed})", unit="images")):
@@ -84,6 +87,10 @@ class Experiments:
                 # only the steps where the cache changed are kept, they are enough to rebuild the cache later
                 if event["added"] is not None:
                     events.append([step, event["added"], event["removed"]])
+                if (step + 1) % log_every == 0:
+                    composition.append({"step": step + 1, "counts": self._cache_composition(model)})
+                if step + 1 in seg_ends:
+                    heldout.append({"segment": seg_ends[step + 1], "acc": self._heldout_acc(model)})
         seconds_per_image = (time.time() - start_time) / len(self.stream)
 
         result = {
@@ -103,10 +110,31 @@ class Experiments:
             "segments": self.segments,
             "correct": correct,
             "events": events,
-            "seconds_per_image": seconds_per_image
+            "seconds_per_image": seconds_per_image,
+            "heldout": heldout,
+            "composition": composition,
         }
         self._save_json(run_path, result)
         print(f"{name}: online accuracy {sum(correct) / len(correct) * 100:.2f}%")
+
+    def _heldout_acc(self, model: CacheModel) -> dict:
+        """accuracy of the current cache on the heldout images of every domain"""
+        acc = {}
+        for domain, ids in self.heldout.items():
+            preds = model.predict(ids)
+            acc[domain] = (preds == model.labels[ids]).float().mean().item()
+
+        return acc
+
+    @staticmethod
+    def _cache_composition(model: CacheModel) -> dict:
+        """how many cached images come from each domain"""
+        counts = {}
+        for idx in model.cache["ids"]:
+            domain = model.domains[idx]
+            counts[domain] = counts.get(domain, 0) + 1
+
+        return counts
 
 def main(order: list, seeds: list, frac: float, runs: list) -> None:
     for seed in seeds:
@@ -119,7 +147,13 @@ def main(order: list, seeds: list, frac: float, runs: list) -> None:
 if __name__ == "__main__":
     runs = [
         {"name": "zero_shot", "eviction": None, "slots": None},
+        {"name": "unbounded", "eviction": "entropy", "slots": None},
+        {"name": "fifo", "eviction": "fifo", "slots": 3},
         {"name": "entropy", "eviction": "entropy", "slots": 3},
+        {"name": "oracle", "eviction": "oracle", "slots": 3},
         {"name": "cmr", "eviction": "cmr", "slots": 3},
+        # upper bound: every image enters the cache with its true label
+        {"name": "true_labels", "eviction": "fifo", "slots": 3, "true_labels": True, "tau": 1.01},
     ]
     main(["Art", "Clipart", "Product", "Real World"], [0], 0.1, runs)
+    # main(["Art", "Clipart", "Product", "Real World"], [0, 1, 2], 1.0, runs)
