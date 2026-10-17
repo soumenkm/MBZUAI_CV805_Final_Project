@@ -157,6 +157,6 @@ if __name__ == "__main__":
         {"name": "true_labels", "eviction": "fifo", "slots": 3, "true_labels": True, "tau": 1.01},
     ]
     seeds = [0, 1, 2]
-    main(["Art", "Clipart", "Product", "Real World"], seeds, 0.1, runs)
-    main(["Real World", "Product", "Clipart", "Art"], seeds, 0.1, runs)
-    main(["Clipart", "Real World", "Art", "Product"], seeds, 0.1, runs)
+    main(["Art", "Clipart", "Product", "Real World"], seeds, 0.5, runs)
+    main(["Real World", "Product", "Clipart", "Art"], seeds, 0.5, runs)
+    main(["Clipart", "Real World", "Art", "Product"], seeds, 0.5, runs)

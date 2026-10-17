@@ -192,6 +192,6 @@ def main(order_tag: str, seeds: list, frac: float) -> None:
     ana.plot_cache_composition(["entropy", "oracle", "cmr"], seed=seeds[0])
 
 if __name__ == "__main__":
-    main("ACPR", [0, 1, 2], 0.1)
-    main("RPCA", [0, 1, 2], 0.1)
-    main("CRAP", [0, 1, 2], 0.1)
+    main("ACPR", [0, 1, 2], 0.5)
+    main("RPCA", [0, 1, 2], 0.5)
+    main("CRAP", [0, 1, 2], 0.5)
