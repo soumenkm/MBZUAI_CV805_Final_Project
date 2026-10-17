@@ -137,10 +137,37 @@ class Analysis:
         print(summary.to_string())
         print(f"Table saved at {csv_path}")
 
+    def plot_online_accuracy(self, methods: list, seed: int, window: int = 100) -> None:
+        """it plots the online accuracy over the stream, averaged over a sliding window, with a line at every domain change"""
+        methods = [m for m in methods if m in self.runs]
+        segments = self.runs[methods[0]][seed]["segments"]
+
+        fig, ax = plt.subplots(figsize=(12, 4))
+        for name in methods:
+            correct = np.array(self.runs[name][seed]["correct"], dtype=float)
+            smooth = np.convolve(correct, np.ones(window) / window, mode="valid")
+            ax.plot(np.arange(len(smooth)) + window, smooth * 100, label=name, linewidth=1)
+
+        for seg in segments:
+            ax.axvline(seg["start"], color="grey", linestyle="--", linewidth=0.5)
+            # the label is placed just above the plot, at the start of the segment
+            ax.text(seg["start"], 1.01, f"{seg['domain'][:4]}{seg['visit'][-1]}", transform=ax.get_xaxis_transform(), fontsize=8)
+
+        ax.set_xlabel("Stream position")
+        ax.set_ylabel(f"Accuracy (%), window {window}")
+        ax.legend(fontsize=8)
+        plt.tight_layout()
+
+        fig_path = Path(self.fig_dir, f"online_{self.order_tag}_seed{seed}_frac{self.frac}.png")
+        plt.savefig(fig_path, dpi=300)
+        plt.close()
+        print(f"Figure saved at {fig_path}")
+
 def main(order_tag: str, seeds: list, frac: float) -> None:
     ana = Analysis(order_tag=order_tag, seeds=seeds, frac=frac)
     ana.zero_shot_table(tau=0.3)
     ana.main_table(["zero_shot", "unbounded", "fifo", "entropy", "oracle", "cmr", "true_labels"])
+    ana.plot_online_accuracy(["zero_shot", "entropy", "cmr", "unbounded"], seed=seeds[0])
 
 if __name__ == "__main__":
     main("ACPR", [0], 0.1)

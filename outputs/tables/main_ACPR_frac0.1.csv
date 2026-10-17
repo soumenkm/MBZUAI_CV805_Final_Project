@@ -1,0 +1,8 @@
+method,online_mean,online_std,clipart_mean,clipart_std,earlier_mean,earlier_std,forgetting_mean,forgetting_std,return_mean,return_std,memory_mean
+zero_shot,79.37,,59.43,,79.75,,0.0,,82.5,,0.0
+unbounded,72.63,,52.86,,72.61,,6.4,,72.0,,908.0
+fifo,79.05,,60.0,,79.46,,0.38,,83.0,,194.0
+entropy,78.81,,58.86,,79.4,,0.26,,81.75,,194.0
+oracle,78.73,,58.86,,79.44,,0.29,,81.5,,194.0
+cmr,79.21,,58.57,,79.75,,0.41,,82.0,,179.0
+true_labels,79.78,,60.0,,80.11,,1.04,,82.75,,195.0

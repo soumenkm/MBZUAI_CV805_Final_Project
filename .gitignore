@@ -3,10 +3,7 @@ outputs/ckpt
 models/
 temp/
 
-*.csv
 *.tsv
-*.json
-*.jsonl
 *.parquet
 *.bin
 *.pt
@@ -19,7 +16,6 @@ temp/
 *.cache
 *.vec
 *.md
-*.json
 __pycache__
 .DS_Store
 .vscode

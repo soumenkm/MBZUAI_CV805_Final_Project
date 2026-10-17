@@ -1,0 +1,5 @@
+domain,zero_shot_acc,admitted,label_acc
+Art,81.05,67.86,94.6
+Clipart,62.34,47.61,88.64
+Product,88.06,84.52,93.84
+Real World,87.19,82.26,94.14
