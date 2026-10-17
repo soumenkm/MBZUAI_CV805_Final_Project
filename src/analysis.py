@@ -163,11 +163,33 @@ class Analysis:
         plt.close()
         print(f"Figure saved at {fig_path}")
 
+    def plot_cache_composition(self, methods: list, seed: int) -> None:
+        """for every method it plots how many cached images come from each domain over the stream"""
+        methods = [m for m in methods if m in self.runs and self.runs[m][seed].get("composition")]
+
+        fig, axs = plt.subplots(1, len(methods), figsize=(5 * len(methods), 4), squeeze=False, sharey=True)
+        for ax, name in zip(axs[0], methods):
+            comp = self.runs[name][seed]["composition"]
+            steps = [c["step"] for c in comp]
+            counts = [[c["counts"].get(d, 0) for c in comp] for d in domains]
+            ax.stackplot(steps, counts, labels=domains)
+            ax.set_title(name)
+            ax.set_xlabel("Stream position")
+            ax.set_ylabel("Cached images")
+        axs[0][0].legend(loc="upper left", fontsize=8)
+        plt.tight_layout()
+
+        fig_path = Path(self.fig_dir, f"composition_{self.order_tag}_seed{seed}_frac{self.frac}.png")
+        plt.savefig(fig_path, dpi=300)
+        plt.close()
+        print(f"Figure saved at {fig_path}")
+
 def main(order_tag: str, seeds: list, frac: float) -> None:
     ana = Analysis(order_tag=order_tag, seeds=seeds, frac=frac)
     ana.zero_shot_table(tau=0.3)
     ana.main_table(["zero_shot", "unbounded", "fifo", "entropy", "oracle", "cmr", "true_labels"])
     ana.plot_online_accuracy(["zero_shot", "entropy", "cmr", "unbounded"], seed=seeds[0])
+    ana.plot_cache_composition(["entropy", "oracle", "cmr"], seed=seeds[0])
 
 if __name__ == "__main__":
     main("ACPR", [0], 0.1)
