@@ -271,5 +271,4 @@ def main(runs: list, tau: float, check_steps: int) -> None:
         print(f"{name:<12}{correct.mean().item() * 100:>7.2f}{row}")
 
 if __name__ == "__main__":
-    main(runs=[("entropy", "entropy", 3), ("cmr", "cmr", 3), ("entropy6", "entropy", 6), ("cmr6", "cmr", 6)],
-         tau=0.3, check_steps=600)
+    main(runs=[("entropy", "entropy", 3), ("cmr", "cmr", 3)], tau=0.3, check_steps=600)

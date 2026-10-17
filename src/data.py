@@ -127,4 +127,6 @@ def main(seed: int, order: list) -> None:
     
 
 if __name__ == "__main__":
-   main(0, ["Art", "Clipart", "Product", "Real World"])
+    main(0, ["Art", "Clipart", "Product", "Real World"])
+    main(0, ["Real World", "Product", "Clipart", "Art"])
+    main(0, ["Clipart", "Real World", "Art", "Product"])
